@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
+// For this driver /drivers/gpu/drm/tiny/gm12u320.c by
+// Hans de Goede <hdegoede@redhat.com> has been used as
+// a blueprint.
 
 #include <linux/module.h>
 #include <linux/usb.h>
@@ -27,7 +30,7 @@
 
 #define DRIVER_NAME "usb2epdiy"
 #define DRIVER_DESC "USB e-paper display with EPDiy-controller"
-#define DRIVER_DATE "2023"
+#define DRIVER_DATE "2024"
 #define DRIVER_MAJOR 1
 #define DRIVER_MINOR 0
 
@@ -135,47 +138,16 @@ static void write_command(
         write_payload_bytes(usb2epdiy, payload, plen);
 }
 
-static void epd_refresh_area(
-	struct usb2epdiy_device *usb2epdiy,
-	uint16_t x, uint16_t y, uint16_t width, uint16_t height
-) {
-	unsigned char refresh_area[] = {
-		(x>>8) & 0xFF,
-		(x) & 0xFF,
-		(y>>8) & 0xFF,
-		(y) & 0xFF,
-		(width>>8) & 0xFF,
-		(width) & 0xFF,
-		(height>>8) & 0xFF,
-		(height) & 0xFF	
-	};
-	write_command(usb2epdiy, 5, refresh_area, sizeof(refresh_area));
-}
-
 static void epd_refresh_display(
 	struct usb2epdiy_device *usb2epdiy
 ) {
 	write_command(usb2epdiy, 4, NULL, 0);
 }
 
-static void epd_set_origin(
-	struct usb2epdiy_device *usb2epdiy,
-	uint16_t x, uint16_t y
-) {
-	unsigned char location[] = {
-		(x>>8) & 0xFF,
-		(x) & 0xFF,
-		(y>>8) & 0xFF,
-		(y) & 0xFF
-	};
-	write_command(usb2epdiy, 2, location, sizeof(location));  // set cursor pos
-}
-
 static void epd_send_image_header(
 	struct usb2epdiy_device *usb2epdiy,
 	uint16_t x, uint16_t y,
-	uint16_t width, uint16_t height,
-	bool is_1bit, bool is_2bit
+	uint16_t width, uint16_t height
 ) {
 	// the esp32-s3 is little endian
 	unsigned char sizeinfo[] = {
@@ -188,52 +160,9 @@ static void epd_send_image_header(
 		(height) & 0xFF,
 		(height>>8) & 0xFF
 	};
-	uint8_t cmdnum = 7;  // 4 bit
-	if(is_1bit)
-		cmdnum = 3;  // 1 bit
-	if(is_2bit)
-		cmdnum = 8;  // 2 bit
+	uint8_t cmdnum = 8;  // 2 bit
 	write_command(usb2epdiy, cmdnum, sizeinfo, sizeof(sizeinfo));  // Send image header
 	// After this, the caller needs to send the pixel data themselves!
-}
-
-#define rep_1bit_stage1 ((1<<5)-1)
-#define rep_1bit_stage2 ((1<<12)-1)
-#define rep_1bit_stage3 ((1<<19)-1)
-#define rep_1bit_stage4 ((1<<26)-1)
-static void epd_send_image_pixels_repeats_1bit(
-	struct usb2epdiy_device *usb2epdiy,
-	u_int8_t color, int64_t repeats
-) {
-    if( repeats <= rep_1bit_stage1 ) {
-        u_int8_t tosend = ((repeats<<2)&(rep_1bit_stage1<<2)) | (color & 0b11);
-        write_payload_bytes(usb2epdiy, &tosend, 1);
-    } else if( repeats <= rep_1bit_stage2 ) {
-        u_int8_t tosend[2];
-        tosend[0] = 0x80 | ((repeats>>5)&(rep_1bit_stage1<<2)) | (color & 0b11);
-        tosend[1] = repeats&0x7F;
-        write_payload_bytes(usb2epdiy, tosend, 2);
-    } else if( repeats <= rep_1bit_stage3 ){
-        u_int8_t tosend[3];
-        tosend[0] = 0x80 | ((repeats>>12)&(rep_1bit_stage1<<2)) | (color & 0b11);
-        tosend[1] = 0x80 | ((repeats>>7)&0x7F);
-        tosend[2] = repeats&0x7F;
-        write_payload_bytes(usb2epdiy, tosend, 3);
-    } else if( repeats <= rep_1bit_stage4 ){
-        u_int8_t tosend[4];
-        tosend[0] = 0x80 | ((repeats>>19)&(rep_1bit_stage1<<2)) | (color & 0b11);
-        tosend[1] = 0x80 | ((repeats>>14)&0x7F);
-        tosend[2] = 0x80 | ((repeats>>7)&0x7F);
-        tosend[3] = repeats&0x7F;
-        write_payload_bytes(usb2epdiy, tosend, 4);
-    } else {
-        while (repeats>rep_1bit_stage4)
-        {
-            epd_send_image_pixels_repeats_1bit(usb2epdiy, color, rep_1bit_stage4);
-            repeats-=(rep_1bit_stage4+1);
-        }
-        epd_send_image_pixels_repeats_1bit(usb2epdiy, color, repeats);
-    }
 }
 
 #define rep_2bit_stage1 ((1<<4)-1)
@@ -275,46 +204,6 @@ static void epd_send_image_pixels_repeats_2bit(
     }
 }
 
-
-#define rep_4bit_stage1 ((1<<2)-1)
-#define rep_4bit_stage2 ((1<<9)-1)
-#define rep_4bit_stage3 ((1<<16)-1)
-#define rep_4bit_stage4 ((1<<23)-1)
-static void epd_send_image_pixels_repeats_4bit(
-	struct usb2epdiy_device *usb2epdiy,
-	u_int8_t color, int64_t repeats
-) {
-    if( repeats <= rep_4bit_stage1 ) {
-        u_int8_t tosend = ((repeats<<5)&(rep_4bit_stage1<<5)) | (color & 0b11111);
-        write_payload_bytes(usb2epdiy, &tosend, 1);
-    } else if( repeats <= rep_4bit_stage2 ) {
-        u_int8_t tosend[2];
-        tosend[0] = 0x80 | ((repeats>>2)&(rep_4bit_stage1<<5)) | (color & 0b11111);
-        tosend[1] = repeats&0x7F;
-        write_payload_bytes(usb2epdiy, tosend, 2);
-    } else if( repeats <= rep_4bit_stage3 ){
-        u_int8_t tosend[3];
-        tosend[0] = 0x80 | ((repeats>>9)&(rep_4bit_stage1<<5)) | (color & 0b11111);
-        tosend[1] = 0x80 | ((repeats>>7)&0x7F);
-        tosend[2] = repeats&0x7F;
-        write_payload_bytes(usb2epdiy, tosend, 3);
-    } else if( repeats <= rep_4bit_stage4 ){
-        u_int8_t tosend[4];
-        tosend[0] = 0x80 | ((repeats>>16)&(rep_4bit_stage1<<5)) | (color & 0b11111);
-        tosend[1] = 0x80 | ((repeats>>14)&0x7F);
-        tosend[2] = 0x80 | ((repeats>>7)&0x7F);
-        tosend[3] = repeats&0x7F;
-        write_payload_bytes(usb2epdiy, tosend, 4);
-    } else {
-        while (repeats>rep_4bit_stage4)
-        {
-            epd_send_image_pixels_repeats_4bit(usb2epdiy, color, rep_4bit_stage4);
-            repeats-=(rep_4bit_stage4+1);
-        }
-        epd_send_image_pixels_repeats_4bit(usb2epdiy, color, repeats);
-    }
-}
-
 static void find_damage(int width, int height, int strides, u8* a, u8* b, struct drm_rect *rect) {
 	int x1=width, y1=height, x2=0, y2=0;
 	u8 *a_row, *b_row;
@@ -346,8 +235,6 @@ static void find_damage(int width, int height, int strides, u8* a, u8* b, struct
 #define MODE_TRANSPARENT    0b0010
 #define MODE_INVERT         0b0100
 
-#define COLOR_DEPTH_1BIT	false
-#define COLOR_DEPTH_2BIT	true
 
 static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 {
@@ -380,7 +267,7 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 	x2 = rect.x2+1;
 	y2 = rect.y2+1;
 
-	epd_send_image_header(usb2epdiy, x1, y1, x2-x1, y2-y1, COLOR_DEPTH_1BIT, COLOR_DEPTH_2BIT);
+	epd_send_image_header(usb2epdiy, x1, y1, x2-x1, y2-y1);
 	u_int8_t color = 0;
 	bool img_has_fb_color = false;
 	bool img_has_inv_fb_color = false;
@@ -393,19 +280,9 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 		buf_row_previous = usb2epdiy->fb_buf_previous + y*usb2epdiy_WIDTH;
 		for( u_int16_t x=x1; x<x2; x++) {
 
-			if(COLOR_DEPTH_1BIT) {
-				thiscolor = buf_row[x] > WHITE_THRESHOLD;
-				previous_color = buf_row_previous[x] > WHITE_THRESHOLD;
-			} else if(COLOR_DEPTH_2BIT) {
-				thiscolor = ((buf_row[x] >> 4)*(buf_row[x] >> 4))>>6;
-				previous_color = ((buf_row_previous[x] >> 4)*(buf_row_previous[x] >> 4))>>6;
-			} else {
-				//thiscolor = buf_row[x] >> 4;
-				//previous_color = buf_row_previous[x] >> 4;
-				thiscolor = ((buf_row[x] >> 4)*(buf_row[x] >> 4))>>4;
-				previous_color = ((buf_row_previous[x] >> 4)*(buf_row_previous[x] >> 4))>>4;
-			}
-
+			thiscolor = ((buf_row[x] >> 4)*(buf_row[x] >> 4))>>6;
+			previous_color = ((buf_row_previous[x] >> 4)*(buf_row_previous[x] >> 4))>>6;
+			
 
 			img_has_fb_color = thiscolor == previous_color;
 			img_has_inv_fb_color = thiscolor == (1-previous_color);
@@ -433,31 +310,15 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 					repeats += 1;
 					mode  &= ~(MODE_TRANSPARENT|MODE_INVERT);
 				} else {
-					if(COLOR_DEPTH_1BIT) {
-						if(mode & MODE_COLOR) {
-							epd_send_image_pixels_repeats_1bit(usb2epdiy, color&1, repeats);
-						} else if(mode & MODE_TRANSPARENT) {
-							epd_send_image_pixels_repeats_1bit(usb2epdiy, 0b10, repeats);
-						} else if(mode & MODE_INVERT) {
-							epd_send_image_pixels_repeats_1bit(usb2epdiy, 0b11, repeats);
-						}
-					} else if(COLOR_DEPTH_2BIT) {
-						if(mode & MODE_COLOR) {
-							epd_send_image_pixels_repeats_2bit(usb2epdiy, color&11, repeats);
-						} else if(mode & MODE_TRANSPARENT) {
-							epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b100, repeats);
-						} else if(mode & MODE_INVERT) {
-							epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b101, repeats);
-						}
-					} else {
-						if(mode & MODE_COLOR) {
-							epd_send_image_pixels_repeats_4bit(usb2epdiy, color&0xF, repeats);
-						} else if(mode & MODE_TRANSPARENT) {
-							epd_send_image_pixels_repeats_4bit(usb2epdiy, 0b10000, repeats);
-						} else if(mode & MODE_INVERT) {
-							epd_send_image_pixels_repeats_4bit(usb2epdiy, 0b10001, repeats);
-						}
+
+					if(mode & MODE_COLOR) {
+						epd_send_image_pixels_repeats_2bit(usb2epdiy, color&11, repeats);
+					} else if(mode & MODE_TRANSPARENT) {
+						epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b100, repeats);
+					} else if(mode & MODE_INVERT) {
+						epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b101, repeats);
 					}
+					
 					color = thiscolor;
 					repeats = 0;
 					mode = MODE_COLOR;
@@ -469,31 +330,15 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 			}
 		}
 	}
-	if(COLOR_DEPTH_1BIT) {
-		if(mode & MODE_COLOR) {
-			epd_send_image_pixels_repeats_1bit(usb2epdiy, color&1, repeats);
-		} else if(mode & MODE_TRANSPARENT) {
-			epd_send_image_pixels_repeats_1bit(usb2epdiy, 0b10, repeats);
-		} else if(mode & MODE_INVERT) {
-			epd_send_image_pixels_repeats_1bit(usb2epdiy, 0b11, repeats);
-		}
-	} else if(COLOR_DEPTH_2BIT) {
-		if(mode & MODE_COLOR) {
-			epd_send_image_pixels_repeats_2bit(usb2epdiy, color&11, repeats);
-		} else if(mode & MODE_TRANSPARENT) {
-			epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b100, repeats);
-		} else if(mode & MODE_INVERT) {
-			epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b101, repeats);
-		}
-	} else {
-		if(mode & MODE_COLOR) {
-			epd_send_image_pixels_repeats_4bit(usb2epdiy, color&0xF, repeats);
-		} else if(mode & MODE_TRANSPARENT) {
-			epd_send_image_pixels_repeats_4bit(usb2epdiy, 0b10000, repeats);
-		} else if(mode & MODE_INVERT) {
-			epd_send_image_pixels_repeats_4bit(usb2epdiy, 0b10001, repeats);
-		}
+
+	if(mode & MODE_COLOR) {
+		epd_send_image_pixels_repeats_2bit(usb2epdiy, color&11, repeats);
+	} else if(mode & MODE_TRANSPARENT) {
+		epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b100, repeats);
+	} else if(mode & MODE_INVERT) {
+		epd_send_image_pixels_repeats_2bit(usb2epdiy, 0b101, repeats);
 	}
+
 	//epd_refresh_area(usb2epdiy, x1, y1, x2-x1, y2-y1);
 	epd_refresh_display(usb2epdiy);
 	serial_flush(usb2epdiy);
@@ -887,5 +732,5 @@ static struct usb_driver usb2epdiy_usb_driver = {
 };
 
 module_usb_driver(usb2epdiy_usb_driver);
-MODULE_AUTHOR("Hans de Goede <hdegoede@redhat.com>");
+MODULE_AUTHOR("Simon Schumann <simon.schumann@web.de>");
 MODULE_LICENSE("GPL");
