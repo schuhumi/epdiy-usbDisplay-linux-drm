@@ -863,6 +863,24 @@ static void usb2epdiy_usb_disconnect(struct usb_interface *interface)
 	usb2epdiy->usbdev = NULL;
 }
 
+static int usb2epdiy_suspend(struct usb_interface *interface,
+			    pm_message_t message)
+{
+	struct drm_device *dev = usb_get_intfdata(interface);
+
+	return drm_mode_config_helper_suspend(dev);
+}
+
+static int usb2epdiy_resume(struct usb_interface *interface)
+{
+	struct drm_device *dev = usb_get_intfdata(interface);
+	struct usb2epdiy_device *usb2epdiy = to_usb2epdiy(dev);
+
+	//gm12u320_set_ecomode(gm12u320);
+
+	return drm_mode_config_helper_resume(dev);
+}
+
 static const struct usb_device_id id_table[] = {
 	{USB_DEVICE(0x303a, 0xa299)},
 	{},
@@ -874,6 +892,9 @@ static struct usb_driver usb2epdiy_usb_driver = {
 	.probe = usb2epdiy_usb_probe,
 	.disconnect = usb2epdiy_usb_disconnect,
 	.id_table = id_table,
+	.suspend = pm_ptr(usb2epdiy_suspend),
+	.resume = pm_ptr(usb2epdiy_resume),
+	.reset_resume = pm_ptr(usb2epdiy_resume),
 };
 
 module_usb_driver(usb2epdiy_usb_driver);
