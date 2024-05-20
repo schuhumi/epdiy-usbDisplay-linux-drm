@@ -14,6 +14,10 @@ install:
 	make -C /lib/modules/$(KVERSION)/build M=$(PWD) modules_install
 	/sbin/depmod -a
 
+uninstall:
+	rm /lib/modules/*/extra/usb2epdiy.ko
+	/sbin/depmod -a
+
 clean:
 	make -C /lib/modules/$(KVERSION)/build M=$(PWD) clean
 

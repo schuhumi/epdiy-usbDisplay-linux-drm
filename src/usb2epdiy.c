@@ -42,12 +42,23 @@
 #define DATA_TIMEOUT		msecs_to_jiffies(1500)
 #define DATA_SND_EPT		0x02
 #define DATA_RCV_EPT		0x82
-#define USB_RCV_BUF_SIZE	32
-#define USB_SND_BUF_SIZE	100000
+#define USB_RCV_BUF_SIZE	64
+#define USB_SND_BUF_SIZE	(128*64)  // number_of_chunks * chunk_size at esp
 
 #define usb2epdiy_ERR(fmt, ...) DRM_DEV_ERROR(usb2epdiy->drmdev.dev, fmt, ##__VA_ARGS__)
 
 #define to_usb2epdiy(__drmdev) container_of(__drmdev, struct usb2epdiy_device, drmdev)
+
+enum command {
+    SEND_128_BYTE = 0,
+    CLEAR_DISPLAY = 1,
+    SET_ORIGIN_POS = 2,
+    REFRESH_DISPLAY = 4,
+    DRAW_IMAGE_2BIT = 8,
+    ECHO_SYNC = 252,
+    UNKNOWN_COMMAND = 254,
+    COMMAND_FOLLOWS = 128
+};
 
 struct usb2epdiy_device {
 	struct drm_device drmdev;
@@ -66,7 +77,8 @@ struct usb2epdiy_device {
 	unsigned char *usb_snd_buf;
 	size_t usb_snd_buf_filled;
 	struct delayed_work poll_if_epdiy_is_ready_work;
-	bool epdiy_is_ready;
+	u8 last_refresh_id;
+	u8 last_refresh_id_rcv;
 };
 
 static void serial_flush(
@@ -94,6 +106,8 @@ static void write_serial(
 	unsigned char *bytes,
 	size_t len
 ) {
+	if(len==0)
+		return;
 	size_t copy_size = 0;
 	while(len) {
 		copy_size = min(USB_SND_BUF_SIZE - usb2epdiy->usb_snd_buf_filled, len);
@@ -112,14 +126,16 @@ static void write_payload_bytes(
 	unsigned char *bytes,
 	unsigned int len
 ) {
-    unsigned char cmd128[] = {0x80, 0x00};
+    unsigned char cmd128[] = {COMMAND_FOLLOWS, SEND_128_BYTE};
+	unsigned int copy_start = 0;
     for(unsigned int i=0; i<len; i++) {
         if( bytes[i]==0x80 ) {
+			write_serial(usb2epdiy, &bytes[copy_start], i-copy_start);
             write_serial(usb2epdiy, cmd128, sizeof(cmd128));
-        } else {
-            write_serial(usb2epdiy, &bytes[i], 1);
+			copy_start = i+1;
         }
     }
+	write_serial(usb2epdiy, &bytes[copy_start], len-copy_start);
 }
 
 static void write_command(
@@ -129,7 +145,7 @@ static void write_command(
 	unsigned int plen
 ) {
     unsigned char cmd[] = {
-        0x80,
+        COMMAND_FOLLOWS,
         0x00
     };
     cmd[1] = cmdno;
@@ -141,7 +157,8 @@ static void write_command(
 static void epd_refresh_display(
 	struct usb2epdiy_device *usb2epdiy
 ) {
-	write_command(usb2epdiy, 4, NULL, 0);
+	usb2epdiy->last_refresh_id++;
+	write_command(usb2epdiy, REFRESH_DISPLAY, &(usb2epdiy->last_refresh_id), 1);
 }
 
 static void epd_send_image_header(
@@ -160,8 +177,7 @@ static void epd_send_image_header(
 		(height) & 0xFF,
 		(height>>8) & 0xFF
 	};
-	uint8_t cmdnum = 8;  // 2 bit
-	write_command(usb2epdiy, cmdnum, sizeinfo, sizeof(sizeinfo));  // Send image header
+	write_command(usb2epdiy, DRAW_IMAGE_2BIT, sizeinfo, sizeof(sizeinfo));  // Send image header
 	// After this, the caller needs to send the pixel data themselves!
 }
 
@@ -205,17 +221,34 @@ static void epd_send_image_pixels_repeats_2bit(
 }
 
 static void find_damage(int width, int height, int strides, u8* a, u8* b, struct drm_rect *rect) {
-	int x1=width, y1=height, x2=0, y2=0;
+	int x1=width, y1=height, x2=-1, y2=-1;
 	u8 *a_row, *b_row;
 	for( int y=0; y<height; y++) {
 		a_row = a + y*strides;
 		b_row = b + y*strides;
-		for( int x=0; x<width; x++) {
+		int x;
+		for( x=0; x<width; x++) {
 			if(a_row[x] != b_row[x]) {
 				if(x1>x) x1=x;
 				if(y1>y) y1=y;
 				if(x2<x) x2=x;
 				if(y2<y) y2=y;
+				break;
+			}
+		}
+		int stop = x;
+		if(y2==y) {
+			// If we already know the damage rectangle extends down to this line as well, we only have
+			// to check the right side of the rectangle.
+			stop = max(stop, x2);
+		}
+		for( x=width-1; x>stop; x--) {
+			if(a_row[x] != b_row[x]) {
+				if(x1>x) x1=x;
+				if(y1>y) y1=y;
+				if(x2<x) x2=x;
+				if(y2<y) y2=y;
+				break;
 			}
 		}
 	}
@@ -223,7 +256,7 @@ static void find_damage(int width, int height, int strides, u8* a, u8* b, struct
 		x1=0; y1=0; x2=0; y2=0;
 	}
 
-	printk(KERN_INFO "Damage: %d,%d - %d,%d\n", x1, y1, x2-x1, y2-y1);
+	printk(KERN_INFO "Damage: %d,%d - %d,%d\n", x1, y1, x2-x1+1, y2-y1+1);
 
 	rect->x1 = x1;
 	rect->y1 = y1;
@@ -231,10 +264,13 @@ static void find_damage(int width, int height, int strides, u8* a, u8* b, struct
 	rect->y2 = y2;
 }
 
+bool epdiy_is_ready(struct usb2epdiy_device *usb2epdiy) {
+	return usb2epdiy->last_refresh_id == usb2epdiy->last_refresh_id_rcv;
+}
+
 #define MODE_COLOR          0b0001
 #define MODE_TRANSPARENT    0b0010
 #define MODE_INVERT         0b0100
-
 
 static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 {
@@ -246,9 +282,8 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 	if(!usb2epdiy->fb_is_dirty)
 		return;
 
-	if(!usb2epdiy->epdiy_is_ready)
+	if(!epdiy_is_ready(usb2epdiy))
 		return;
-	usb2epdiy->epdiy_is_ready = false;
 
 	mutex_lock(&usb2epdiy->fb_lock);
 	swap(usb2epdiy->fb_buf, usb2epdiy->fb_buf_outgoing);
@@ -359,52 +394,96 @@ static void usb2epdiy_send_fb_worker(struct work_struct *work) {
 
 static void poll_if_epdiy_is_ready(struct work_struct *work)
 {
+	static u8 previous_command = UNKNOWN_COMMAND;
+	static u8 current_command = UNKNOWN_COMMAND;
 	static int busyctr = 0;
 	struct usb2epdiy_device *usb2epdiy = container_of(
 		to_delayed_work(work),
 		struct usb2epdiy_device,
 		poll_if_epdiy_is_ready_work
 	);
-	if (usb2epdiy->epdiy_is_ready)
-		goto queue_next_poll;
 	int actual_len;
 	int ret = 0;
-	ret = usb_bulk_msg(usb2epdiy->usbdev,
+	ret = usb_bulk_msg(
+		usb2epdiy->usbdev,
 		usb_rcvbulkpipe(usb2epdiy->usbdev, DATA_RCV_EPT),
-		usb2epdiy->usb_rcv_buf, 3,
+		usb2epdiy->usb_rcv_buf,
+		USB_RCV_BUF_SIZE,
 		&actual_len,
-		1  // timeout
+		10  // timeout
 	);
 	if(!ret) {
+		// We received something
 		for(int j=0; j<actual_len; j++) {
-			if(usb2epdiy->usb_rcv_buf[j] == 'r') { //5
-				printk(KERN_INFO "Received synchronization byte.\n");
-				usb2epdiy->epdiy_is_ready = true;
-				queue_delayed_work(
-					system_long_wq,
-					&usb2epdiy->fb_update_work,
-					msecs_to_jiffies(0)
-				);
-				goto queue_next_poll;
+			u8 byte = usb2epdiy->usb_rcv_buf[j];
+
+			if( byte == COMMAND_FOLLOWS ) {
+				previous_command = current_command;
+				current_command = COMMAND_FOLLOWS;
+				continue;
 			}
+
+			if( current_command == COMMAND_FOLLOWS ) {
+				switch(byte) {
+					case SEND_128_BYTE:
+						current_command = previous_command;
+						previous_command = UNKNOWN_COMMAND;
+						byte = 128;  // Will be processed below
+						break;
+					case REFRESH_DISPLAY:
+						previous_command = current_command;
+						current_command = REFRESH_DISPLAY;
+						continue;
+					default:
+                    	printk(
+							KERN_WARNING "do not know how to interpret this byte after 'command follows' byte: %hhu\n",
+							byte
+						);
+                    	continue;
+				};
+			}
+
+			switch(current_command) {
+				case REFRESH_DISPLAY:
+					printk(KERN_INFO "Received synchronization byte: %hhu\n", byte);
+					usb2epdiy->last_refresh_id_rcv = byte;
+					busyctr = 0;
+					previous_command = REFRESH_DISPLAY;
+                    current_command = UNKNOWN_COMMAND;
+					queue_delayed_work(
+						system_long_wq,
+						&usb2epdiy->fb_update_work,
+						msecs_to_jiffies(0)
+					);
+					continue;
+				default:
+					if( current_command != previous_command ) {
+						printk(KERN_WARNING "Current command is unknown: %hhu\n", current_command);
+						previous_command = current_command;
+					}
+					continue;
+			};
 		}
 	}
-	busyctr++;
-	if(busyctr>30) {
-		printk(KERN_INFO "Waiting for synchronization byte timed out, maybe we lost it.\n");
-		usb2epdiy->epdiy_is_ready = true;
-		queue_delayed_work(
-			system_long_wq,
-			&usb2epdiy->fb_update_work,
-			msecs_to_jiffies(0)
-		);
+	if(!epdiy_is_ready(usb2epdiy)) {
+		busyctr++;
+		if(busyctr>10) {
+			printk(KERN_INFO "Waiting for synchronization byte timed out, maybe we lost it.\n");
+			usb2epdiy->last_refresh_id_rcv = usb2epdiy->last_refresh_id;
+			busyctr = 0;
+			queue_delayed_work(
+				system_long_wq,
+				&usb2epdiy->fb_update_work,
+				msecs_to_jiffies(0)
+			);
+		}
+	} else {
 		busyctr = 0;
 	}
-queue_next_poll:
 	queue_delayed_work(
 		system_long_wq,
 		&usb2epdiy->poll_if_epdiy_is_ready_work,
-		msecs_to_jiffies(100)
+		msecs_to_jiffies(30)
 	);
 }
 
@@ -453,7 +532,7 @@ static int usb2epdiy_conn_init(struct usb2epdiy_device *usb2epdiy)
 static void usb2epdiy_pipe_update(struct drm_simple_display_pipe *pipe,
 								  struct drm_plane_state *old_state)
 {
-	printk(KERN_INFO "usb2epdiy_pipe_update\n");
+	//printk(KERN_INFO "usb2epdiy_pipe_update\n");
 	struct drm_plane_state *state = pipe->plane.state;
 	struct drm_framebuffer *drm_fb = state->fb;
 	struct drm_shadow_plane_state *shadow_plane_state = to_drm_shadow_plane_state(state);
@@ -483,7 +562,7 @@ static void usb2epdiy_pipe_update(struct drm_simple_display_pipe *pipe,
 
 	mutex_unlock(&usb2epdiy->fb_lock);
 
-	if(usb2epdiy->epdiy_is_ready) {
+	if(epdiy_is_ready(usb2epdiy)) {
 		queue_delayed_work(
 			system_long_wq,
 			&usb2epdiy->fb_update_work,
@@ -500,7 +579,7 @@ static void usb2epdiy_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct usb2epdiy_device *usb2epdiy = to_usb2epdiy(pipe->crtc.dev);
 	printk(KERN_INFO "usb2epdiy_pipe_enable\n");
 	usb2epdiy->pipe_enabled = true;
-	usb2epdiy->epdiy_is_ready = true;
+	usb2epdiy->last_refresh_id_rcv = usb2epdiy->last_refresh_id;
 	usb2epdiy_pipe_update(pipe, NULL);
 	mod_delayed_work(
 		system_long_wq,
@@ -519,7 +598,7 @@ static void usb2epdiy_pipe_disable(struct drm_simple_display_pipe *pipe)
 	struct usb2epdiy_device *usb2epdiy = to_usb2epdiy(pipe->crtc.dev);
 	printk(KERN_INFO "usb2epdiy_pipe_disable\n");
 	usb2epdiy->pipe_enabled = false;
-	usb2epdiy->epdiy_is_ready = false;
+	usb2epdiy->last_refresh_id_rcv = usb2epdiy->last_refresh_id-1;
 #if 0
 	struct usb2epdiy_device *usb2epdiy = to_usb2epdiy(pipe->crtc.dev);
 
@@ -633,6 +712,8 @@ static int usb2epdiy_usb_probe(
 	usb2epdiy->usb_snd_buf_filled = 0;
 	INIT_DELAYED_WORK(&usb2epdiy->fb_update_work, usb2epdiy_send_fb_worker);
 	INIT_DELAYED_WORK(&usb2epdiy->poll_if_epdiy_is_ready_work, poll_if_epdiy_is_ready);
+	usb2epdiy->last_refresh_id = 0;
+	usb2epdiy->last_refresh_id_rcv = 0;
 
 	usb2epdiy->dmadev = usb_intf_get_dma_device(to_usb_interface(drmdev->dev));
 	if (!usb2epdiy->dmadev)
