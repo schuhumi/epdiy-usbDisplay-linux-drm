@@ -36,9 +36,6 @@
 
 #define WHITE_THRESHOLD 200
 
-#define usb2epdiy_WIDTH 1600
-#define usb2epdiy_HEIGHT 1200
-
 #define DATA_TIMEOUT		msecs_to_jiffies(1500)
 #define DATA_SND_EPT		0x02
 #define DATA_RCV_EPT		0x82
@@ -50,14 +47,15 @@
 #define to_usb2epdiy(__drmdev) container_of(__drmdev, struct usb2epdiy_device, drmdev)
 
 enum command {
-    SEND_128_BYTE = 0,
-    CLEAR_DISPLAY = 1,
-    SET_ORIGIN_POS = 2,
-    REFRESH_DISPLAY = 4,
-    DRAW_IMAGE_2BIT = 8,
-    ECHO_SYNC = 252,
+    COMMAND_FOLLOWS = 128,
+    SEND_128_BYTE   = 0,
     UNKNOWN_COMMAND = 254,
-    COMMAND_FOLLOWS = 128
+
+    SCREEN_SIZE     = 10,
+
+    CLEAR_DISPLAY   = 100,
+    REFRESH_DISPLAY = 101,
+    DRAW_IMAGE_2BIT = 150
 };
 
 struct usb2epdiy_device {
@@ -71,12 +69,14 @@ struct usb2epdiy_device {
 	u8 *fb_buf;
 	u8 *fb_buf_outgoing;
 	u8 *fb_buf_previous;
+	uint16_t width;
+	uint16_t height;
 	bool pipe_enabled;
 	struct delayed_work fb_update_work;
 	unsigned char *usb_rcv_buf;
 	unsigned char *usb_snd_buf;
 	size_t usb_snd_buf_filled;
-	struct delayed_work poll_if_epdiy_is_ready_work;
+	struct delayed_work digest_stream_work;
 	u8 last_refresh_id;
 	u8 last_refresh_id_rcv;
 };
@@ -265,7 +265,7 @@ static void find_damage(int width, int height, int strides, u8* a, u8* b, struct
 }
 
 bool epdiy_is_ready(struct usb2epdiy_device *usb2epdiy) {
-	return usb2epdiy->last_refresh_id == usb2epdiy->last_refresh_id_rcv;
+	return usb2epdiy->width && (usb2epdiy->last_refresh_id == usb2epdiy->last_refresh_id_rcv);
 }
 
 #define MODE_COLOR          0b0001
@@ -274,7 +274,7 @@ bool epdiy_is_ready(struct usb2epdiy_device *usb2epdiy) {
 
 static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 {
-	uint16_t x1=0, y1=0, x2=usb2epdiy_WIDTH, y2=usb2epdiy_HEIGHT;
+	uint16_t x1=0, y1=0, x2=usb2epdiy->width, y2=usb2epdiy->height;
 	u8 *buf_row;
 	u8 *buf_row_previous;
 	struct drm_rect rect;
@@ -293,7 +293,7 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 	printk(KERN_INFO "Sending framebuffer to display\n");
 
 	find_damage(
-		usb2epdiy_WIDTH, usb2epdiy_HEIGHT, usb2epdiy_WIDTH,
+		usb2epdiy->width, usb2epdiy->height, usb2epdiy->width,
 		usb2epdiy->fb_buf_outgoing, usb2epdiy->fb_buf_previous,
 		&rect
 	);
@@ -311,8 +311,8 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 	u8 thiscolor;
 	u8 previous_color;
 	for( u_int16_t y=y1; y<y2; y++) {
-		buf_row = usb2epdiy->fb_buf_outgoing + y*usb2epdiy_WIDTH;
-		buf_row_previous = usb2epdiy->fb_buf_previous + y*usb2epdiy_WIDTH;
+		buf_row = usb2epdiy->fb_buf_outgoing + y*usb2epdiy->width;
+		buf_row_previous = usb2epdiy->fb_buf_previous + y*usb2epdiy->width;
 		for( u_int16_t x=x1; x<x2; x++) {
 
 			thiscolor = ((buf_row[x] >> 4)*(buf_row[x] >> 4))>>6;
@@ -377,7 +377,7 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 	//epd_refresh_area(usb2epdiy, x1, y1, x2-x1, y2-y1);
 	epd_refresh_display(usb2epdiy);
 	serial_flush(usb2epdiy);
-	memcpy(usb2epdiy->fb_buf_previous, usb2epdiy->fb_buf_outgoing, usb2epdiy_WIDTH * usb2epdiy_HEIGHT);
+	memcpy(usb2epdiy->fb_buf_previous, usb2epdiy->fb_buf_outgoing, (size_t)usb2epdiy->width * usb2epdiy->height);
 }
 
 
@@ -392,118 +392,25 @@ static void usb2epdiy_send_fb_worker(struct work_struct *work) {
 	usb2epdiy_send_fb(usb2epdiy);
 }
 
-static void poll_if_epdiy_is_ready(struct work_struct *work)
-{
-	static u8 previous_command = UNKNOWN_COMMAND;
-	static u8 current_command = UNKNOWN_COMMAND;
-	static int busyctr = 0;
-	struct usb2epdiy_device *usb2epdiy = container_of(
-		to_delayed_work(work),
-		struct usb2epdiy_device,
-		poll_if_epdiy_is_ready_work
-	);
-	int actual_len;
-	int ret = 0;
-	ret = usb_bulk_msg(
-		usb2epdiy->usbdev,
-		usb_rcvbulkpipe(usb2epdiy->usbdev, DATA_RCV_EPT),
-		usb2epdiy->usb_rcv_buf,
-		USB_RCV_BUF_SIZE,
-		&actual_len,
-		10  // timeout
-	);
-	if(!ret) {
-		// We received something
-		for(int j=0; j<actual_len; j++) {
-			u8 byte = usb2epdiy->usb_rcv_buf[j];
-
-			if( byte == COMMAND_FOLLOWS ) {
-				previous_command = current_command;
-				current_command = COMMAND_FOLLOWS;
-				continue;
-			}
-
-			if( current_command == COMMAND_FOLLOWS ) {
-				switch(byte) {
-					case SEND_128_BYTE:
-						current_command = previous_command;
-						previous_command = UNKNOWN_COMMAND;
-						byte = 128;  // Will be processed below
-						break;
-					case REFRESH_DISPLAY:
-						previous_command = current_command;
-						current_command = REFRESH_DISPLAY;
-						continue;
-					default:
-                    	printk(
-							KERN_WARNING "do not know how to interpret this byte after 'command follows' byte: %hhu\n",
-							byte
-						);
-                    	continue;
-				};
-			}
-
-			switch(current_command) {
-				case REFRESH_DISPLAY:
-					printk(KERN_INFO "Received synchronization byte: %hhu\n", byte);
-					usb2epdiy->last_refresh_id_rcv = byte;
-					busyctr = 0;
-					previous_command = REFRESH_DISPLAY;
-                    current_command = UNKNOWN_COMMAND;
-					queue_delayed_work(
-						system_long_wq,
-						&usb2epdiy->fb_update_work,
-						msecs_to_jiffies(0)
-					);
-					continue;
-				default:
-					if( current_command != previous_command ) {
-						printk(KERN_WARNING "Current command is unknown: %hhu\n", current_command);
-						previous_command = current_command;
-					}
-					continue;
-			};
-		}
-	}
-	if(!epdiy_is_ready(usb2epdiy)) {
-		busyctr++;
-		if(busyctr>10) {
-			printk(KERN_INFO "Waiting for synchronization byte timed out, maybe we lost it.\n");
-			usb2epdiy->last_refresh_id_rcv = usb2epdiy->last_refresh_id;
-			busyctr = 0;
-			queue_delayed_work(
-				system_long_wq,
-				&usb2epdiy->fb_update_work,
-				msecs_to_jiffies(0)
-			);
-		}
-	} else {
-		busyctr = 0;
-	}
-	queue_delayed_work(
-		system_long_wq,
-		&usb2epdiy->poll_if_epdiy_is_ready_work,
-		msecs_to_jiffies(30)
-	);
-}
-
 
 
 /* ------------------------------------------------------------------ */
 /* usb2epdiy connector						      */
 
-static const struct drm_display_mode usb2epdiy_mode = {
-	DRM_MODE_INIT(
-		60, // refresh rate in hertz
-		usb2epdiy_WIDTH,
-		usb2epdiy_HEIGHT,
-		271, // width in mm
-		203	 // height in mm
-		),
-};
-
 static int usb2epdiy_conn_get_modes(struct drm_connector *connector)
 {
+	static struct drm_display_mode usb2epdiy_mode;
+	struct usb2epdiy_device *usb2epdiy = to_usb2epdiy(connector->dev);
+	usb2epdiy_mode = (struct drm_display_mode){
+		DRM_MODE_INIT(
+			20, // refresh rate in hertz
+			usb2epdiy->width,
+			usb2epdiy->height,
+			271, // width in mm
+			203	 // height in mm
+		),
+	};
+
 	return drm_connector_helper_get_modes_fixed(connector, &usb2epdiy_mode);
 }
 
@@ -540,7 +447,7 @@ static void usb2epdiy_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct iosys_map dst;
 	unsigned int dst_pitch = 0;
 	int ret;
-	struct drm_rect fullrect = { 0, 0, usb2epdiy_WIDTH, usb2epdiy_HEIGHT };
+	struct drm_rect fullrect = { 0, 0, usb2epdiy->width, usb2epdiy->height };
 
 	if(!usb2epdiy->pipe_enabled)
 		return;
@@ -588,7 +495,7 @@ static void usb2epdiy_pipe_enable(struct drm_simple_display_pipe *pipe,
 	);
 	mod_delayed_work(
 		system_long_wq,
-		&usb2epdiy->poll_if_epdiy_is_ready_work,
+		&usb2epdiy->digest_stream_work,
 		msecs_to_jiffies(1100)
 	);
 }
@@ -675,6 +582,171 @@ static const struct drm_mode_config_funcs usb2epdiy_mode_config_funcs = {
 
 /* ***** USB to drm_device ***** */
 
+static void digest_stream(struct work_struct *work)
+{
+	static uint32_t payload_bytes_counter = 0;
+	static u8 previous_command = UNKNOWN_COMMAND;
+	static u8 current_command = UNKNOWN_COMMAND;
+	static int busyctr = 0;
+	static uint16_t new_width, new_height;
+	struct usb2epdiy_device *usb2epdiy = container_of(
+		to_delayed_work(work),
+		struct usb2epdiy_device,
+		digest_stream_work
+	);
+	int actual_len;
+	int ret = 0;
+	ret = usb_bulk_msg(
+		usb2epdiy->usbdev,
+		usb_rcvbulkpipe(usb2epdiy->usbdev, DATA_RCV_EPT),
+		usb2epdiy->usb_rcv_buf,
+		USB_RCV_BUF_SIZE,
+		&actual_len,
+		10  // timeout
+	);
+	if(!ret) {
+		// We received something
+		for(int j=0; j<actual_len; j++) {
+			u8 byte = usb2epdiy->usb_rcv_buf[j];
+
+			if( byte == COMMAND_FOLLOWS ) {
+				previous_command = current_command;
+				current_command = COMMAND_FOLLOWS;
+				continue;
+			}
+
+			if( current_command == COMMAND_FOLLOWS ) {
+				switch(byte) {
+					case SEND_128_BYTE:
+						current_command = previous_command;
+						previous_command = UNKNOWN_COMMAND;
+						byte = 128;  // Will be processed below
+						break;
+					case REFRESH_DISPLAY:
+						previous_command = current_command;
+						current_command = REFRESH_DISPLAY;
+						continue;
+					case SCREEN_SIZE:
+						payload_bytes_counter = 0;
+						previous_command = current_command;
+						current_command = SCREEN_SIZE;
+						continue;
+					default:
+                    	printk(
+							KERN_WARNING "do not know how to interpret this byte after 'command follows' byte: %hhu\n",
+							byte
+						);
+                    	continue;
+				};
+			}
+
+			switch(current_command) {
+				case REFRESH_DISPLAY:
+					printk(KERN_INFO "Received synchronization byte: %hhu\n", byte);
+					usb2epdiy->last_refresh_id_rcv = byte;
+					busyctr = 0;
+					previous_command = REFRESH_DISPLAY;
+                    current_command = UNKNOWN_COMMAND;
+					queue_delayed_work(
+						system_long_wq,
+						&usb2epdiy->fb_update_work,
+						msecs_to_jiffies(0)
+					);
+					continue;
+				case SCREEN_SIZE:
+					switch (payload_bytes_counter) {
+						case 0: new_width = ((uint16_t)byte); break;
+						case 1: new_width |= ((uint16_t)byte)<<8; break;
+						case 2: new_height = ((uint16_t)byte); break;
+						case 3: new_height |= ((uint16_t)byte)<<8;
+							printk(KERN_INFO "Received new screen size: %dx%d\n", new_width, new_height);
+							if(usb2epdiy->width != new_width || usb2epdiy->height != new_height) {
+								bool init_drm = usb2epdiy->width == 0;
+								if(init_drm) {
+									usb2epdiy->width = new_width;
+									usb2epdiy->height = new_height;
+
+									if(usb2epdiy->fb_buf) kfree(usb2epdiy->fb_buf);
+									if(usb2epdiy->fb_buf_outgoing) kfree(usb2epdiy->fb_buf_outgoing);
+									if(usb2epdiy->fb_buf_previous) kfree(usb2epdiy->fb_buf_previous);
+
+									usb2epdiy->fb_buf = kmalloc((size_t)new_width * new_height, GFP_KERNEL);
+									usb2epdiy->fb_buf_outgoing = kmalloc((size_t)new_width * new_height, GFP_KERNEL);
+									usb2epdiy->fb_buf_previous = kmalloc((size_t)new_width * new_height, GFP_KERNEL);
+
+									usb2epdiy->drmdev.mode_config.min_width  = new_width;
+									usb2epdiy->drmdev.mode_config.max_width  = new_width;
+									usb2epdiy->drmdev.mode_config.min_height = new_height;
+									usb2epdiy->drmdev.mode_config.max_height = new_height;
+
+									int ret;
+									ret = drm_simple_display_pipe_init(
+										&usb2epdiy->drmdev,
+										&usb2epdiy->pipe,
+										&usb2epdiy_pipe_funcs,
+										usb2epdiy_pipe_formats,
+										ARRAY_SIZE(usb2epdiy_pipe_formats),
+										usb2epdiy_pipe_modifiers,
+										&usb2epdiy->conn
+									);
+									if (ret)
+										printk(KERN_WARNING "Failed to initialize simple display pipe\n");
+										//goto err_put_device;
+
+									drm_mode_config_reset(&usb2epdiy->drmdev);
+
+									ret = drm_dev_register(&usb2epdiy->drmdev, 0);
+									if (ret)
+										//goto err_put_device;
+										printk(KERN_WARNING "Failed to register drm device\n");
+
+									drm_fbdev_generic_setup(&usb2epdiy->drmdev, 0);
+
+									queue_delayed_work(
+										system_long_wq,
+										&usb2epdiy->fb_update_work,
+										msecs_to_jiffies(0)
+									);
+								} else {
+									printk(KERN_WARNING "Screen size changed, but we are not ready to handle this yet\n");
+								}
+							}
+							continue;
+					}
+					payload_bytes_counter++;
+					continue;
+
+				default:
+					if( current_command != previous_command ) {
+						printk(KERN_WARNING "Current command is unknown: %hhu\n", current_command);
+						previous_command = current_command;
+					}
+					continue;
+			};
+		}
+	}
+	if(!epdiy_is_ready(usb2epdiy)) {
+		busyctr++;
+		if(busyctr>10) {
+			printk(KERN_INFO "Waiting for synchronization byte timed out, maybe we lost it.\n");
+			usb2epdiy->last_refresh_id_rcv = usb2epdiy->last_refresh_id;
+			busyctr = 0;
+			queue_delayed_work(
+				system_long_wq,
+				&usb2epdiy->fb_update_work,
+				msecs_to_jiffies(0)
+			);
+		}
+	} else {
+		busyctr = 0;
+	}
+	queue_delayed_work(
+		system_long_wq,
+		&usb2epdiy->digest_stream_work,
+		msecs_to_jiffies(30)
+	);
+}
+
 static int usb2epdiy_usb_probe(
 	struct usb_interface *usbinterface,
 	const struct usb_device_id *id
@@ -704,14 +776,16 @@ static int usb2epdiy_usb_probe(
 	printk(KERN_INFO "usb2epdiy created drm_device\n");
 
 	mutex_init(&usb2epdiy->fb_lock);
-	usb2epdiy->fb_buf = kmalloc(usb2epdiy_WIDTH * usb2epdiy_HEIGHT, GFP_KERNEL);
-	usb2epdiy->fb_buf_outgoing = kmalloc(usb2epdiy_WIDTH * usb2epdiy_HEIGHT, GFP_KERNEL);
-	usb2epdiy->fb_buf_previous = kmalloc(usb2epdiy_WIDTH * usb2epdiy_HEIGHT, GFP_KERNEL);
+	usb2epdiy->width = 0;
+	usb2epdiy->height = 0;
+	usb2epdiy->fb_buf = NULL;
+	usb2epdiy->fb_buf_outgoing = NULL;
+	usb2epdiy->fb_buf_previous = NULL;
 	usb2epdiy->usb_rcv_buf = kmalloc(USB_RCV_BUF_SIZE+1, GFP_KERNEL);
 	usb2epdiy->usb_snd_buf = kmalloc(USB_SND_BUF_SIZE+1, GFP_KERNEL);
 	usb2epdiy->usb_snd_buf_filled = 0;
 	INIT_DELAYED_WORK(&usb2epdiy->fb_update_work, usb2epdiy_send_fb_worker);
-	INIT_DELAYED_WORK(&usb2epdiy->poll_if_epdiy_is_ready_work, poll_if_epdiy_is_ready);
+	INIT_DELAYED_WORK(&usb2epdiy->digest_stream_work, digest_stream);
 	usb2epdiy->last_refresh_id = 0;
 	usb2epdiy->last_refresh_id_rcv = 0;
 
@@ -723,10 +797,10 @@ static int usb2epdiy_usb_probe(
 	if (ret)
 		goto err_put_device;
 
-	drmdev->mode_config.min_width = usb2epdiy_WIDTH;
-	drmdev->mode_config.max_width = usb2epdiy_WIDTH;
-	drmdev->mode_config.min_height = usb2epdiy_HEIGHT;
-	drmdev->mode_config.max_height = usb2epdiy_HEIGHT;
+	drmdev->mode_config.min_width  = 0;
+	drmdev->mode_config.max_width  = 0;
+	drmdev->mode_config.min_height = 0;
+	drmdev->mode_config.max_height = 0;
 	drmdev->mode_config.prefer_shadow = 1;
 	drmdev->mode_config.funcs = &usb2epdiy_mode_config_funcs;
 
@@ -736,23 +810,13 @@ static int usb2epdiy_usb_probe(
 	if (ret)
 		goto err_put_device;
 
-	ret = drm_simple_display_pipe_init(&usb2epdiy->drmdev,
-									   &usb2epdiy->pipe,
-									   &usb2epdiy_pipe_funcs,
-									   usb2epdiy_pipe_formats,
-									   ARRAY_SIZE(usb2epdiy_pipe_formats),
-									   usb2epdiy_pipe_modifiers,
-									   &usb2epdiy->conn);
-	if (ret)
-		goto err_put_device;
-
-	drm_mode_config_reset(drmdev);
-
-	ret = drm_dev_register(drmdev, 0);
-	if (ret)
-		goto err_put_device;
-
-	drm_fbdev_generic_setup(drmdev, 0);
+	write_command(usb2epdiy, SCREEN_SIZE, NULL, 0);
+	serial_flush(usb2epdiy);
+	queue_delayed_work(
+		system_long_wq,
+		&usb2epdiy->digest_stream_work,
+		msecs_to_jiffies(50)
+	);
 
 	return 0;
 
@@ -767,7 +831,7 @@ static void usb2epdiy_usb_disconnect(struct usb_interface *interface)
 	struct drm_device *drmdev = usb_get_intfdata(interface);
 	struct usb2epdiy_device *usb2epdiy = to_usb2epdiy(drmdev);
 
-	cancel_delayed_work_sync(&usb2epdiy->poll_if_epdiy_is_ready_work);
+	cancel_delayed_work_sync(&usb2epdiy->digest_stream_work);
 	cancel_delayed_work_sync(&usb2epdiy->fb_update_work);
 
 	if(usb2epdiy->dmadev) {
