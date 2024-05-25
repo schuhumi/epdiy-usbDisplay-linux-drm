@@ -320,7 +320,7 @@ static void usb2epdiy_send_fb(struct usb2epdiy_device *usb2epdiy)
 			
 
 			img_has_fb_color = thiscolor == previous_color;
-			img_has_inv_fb_color = thiscolor == (1-previous_color);
+			img_has_inv_fb_color = ((thiscolor^previous_color) & 0b11) == 0b11;  // All bits are inverted
 
 			if( repeats == -1 ) {
 				color = thiscolor;
